@@ -1,0 +1,1 @@
+# SIR-based-game-of-life
