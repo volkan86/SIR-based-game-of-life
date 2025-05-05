@@ -1,0 +1,158 @@
+import numpy as np
+import matplotlib.pyplot as plt
+from matplotlib.colors import ListedColormap
+from matplotlib.widgets import Slider, Button
+from matplotlib.animation import FuncAnimation
+import matplotlib.gridspec as gridspec
+from scipy.signal import convolve2d      # fast neighbourhood averaging
+
+# --------------------------- CONSTANTS ----------------------------
+GRID_SIZE            = (40, 40)          # lattice size
+INIT_INFECTED_RATIO  = 0.04              # initial share of infected cells
+DT                   = 0.2               # Euler time-step
+HISTORY_WINDOW       = 100               # last N steps in the line chart
+MAX_FRAMES           = 1000              # cap for FuncAnimation
+CMAP = ListedColormap(['#2ecc71',        # Susceptible  – green
+                       '#e74c3c',        # Infected     – red
+                       '#f1c40f'])       # Recovered    – yellow
+
+# ------------------------- SIR-SIMULATION -------------------------
+class SIRSimulation:
+    def __init__(self):
+        # model parameters (editable by sliders)
+        self.beta  = 0.35               # infection rate
+        self.gamma = 0.10               # recovery  rate
+
+        self.state = self.init_grid()   # state[...,0]=S, [...,1]=I, [...,2]=R
+        self.history = {'S': [], 'I': [], 'R': []}
+        self._build_ui()
+        self.ani = None                 # animation handler
+
+        # 3×3 Moore-neighbourhood kernel (centre = 0)
+        self.kernel = np.array([[1,1,1],
+                                [1,0,1],
+                                [1,1,1]], dtype=np.float32)
+
+    # ----------------------- INITIALISATION -----------------------
+    def init_grid(self):
+        h, w = GRID_SIZE
+        state = np.zeros((h, w, 3), dtype=np.float32)
+        # everyone starts susceptible …
+        state[..., 0] = 1.0
+        # … but a small random subset is infected
+        mask = np.random.rand(h, w) < INIT_INFECTED_RATIO
+        state[mask, 0] = 0.0   # remove S where infected
+        state[mask, 1] = 1.0   # set I = 1
+        return state
+
+    # -------------------- NEIGHBOUR AVERAGING ---------------------
+    def infected_neighbour_frac(self):
+        """
+        Return the mean infected fraction in the Moore neighbourhood
+        for every cell (periodic boundaries via mode='wrap').
+        """
+        I = self.state[..., 1]
+        return convolve2d(I, self.kernel, mode='same', boundary='wrap') / 8.0
+
+    # ------------------------- ONE TIME STEP ----------------------
+    def step(self):
+        S, I, R = [self.state[..., i] for i in range(3)]
+        I_neigh  = self.infected_neighbour_frac()
+
+        dS = -self.beta  * S * I_neigh
+        dI =  self.beta  * S * I_neigh - self.gamma * I
+        dR =  self.gamma * I
+
+        S += DT * dS
+        I += DT * dI
+        R += DT * dR
+
+        # numerical hygiene
+        np.clip(S, 0.0, 1.0, out=S)
+        np.clip(I, 0.0, 1.0, out=I)
+        np.clip(R, 0.0, 1.0, out=R)
+        total = S + I + R
+        total[total == 0] = 1.0          # avoid division by zero
+        S /= total; I /= total; R /= total
+
+    # --------------------- GRAPHICAL INTERFACE --------------------
+    def _build_ui(self):
+        plt.close('all')
+        self.fig = plt.figure(figsize=(10, 8), constrained_layout=True)
+        gs = gridspec.GridSpec(4, 2, figure=self.fig)
+
+        # lattice display ----------------------------------------------------
+        self.ax_grid = self.fig.add_subplot(gs[0, 0])
+        self.grid_img = self.ax_grid.imshow(np.argmax(self.state, -1),
+                                            cmap=CMAP, vmin=0, vmax=2)
+        self.ax_grid.set_title("Neigh-SIR Lattice")
+
+        # proportion time-series --------------------------------------------
+        self.ax_plot = self.fig.add_subplot(gs[0, 1])
+        self.lines = {k: self.ax_plot.plot([], [], color=c, label=k, lw=2)[0]
+                      for k, c in zip(['S', 'I', 'R'], CMAP.colors)}
+        self.ax_plot.set_ylim(0, 1)
+        self.ax_plot.set_xlim(0, HISTORY_WINDOW)
+        self.ax_plot.set_title("Population Proportions")
+        self.ax_plot.legend()
+        self.ax_plot.grid(ls=':')
+
+        # sliders ------------------------------------------------------------
+        self.ax_beta  = self.fig.add_subplot(gs[2, 0])
+        self.ax_gamma = self.fig.add_subplot(gs[2, 1])
+        self.slider_beta  = Slider(self.ax_beta,  r'β infection', 0.0, 1.0,
+                                   valinit=self.beta)
+        self.slider_gamma = Slider(self.ax_gamma, r'γ recovery', 0.0, 1.0,
+                                   valinit=self.gamma)
+        self.slider_beta.on_changed(lambda v: setattr(self, 'beta', v))
+        self.slider_gamma.on_changed(lambda v: setattr(self, 'gamma', v))
+
+        # reset button -------------------------------------------------------
+        self.ax_reset = self.fig.add_subplot(gs[3, :])
+        self.but_reset = Button(self.ax_reset, 'Reset Simulation',
+                                hovercolor='0.85')
+        self.but_reset.on_clicked(self.reset)
+
+    def reset(self, _=None):
+        self.state   = self.init_grid()
+        self.history = {'S': [], 'I': [], 'R': []}
+        self.grid_img.set_data(np.argmax(self.state, -1))
+        for line in self.lines.values():
+            line.set_data([], [])
+        self.ax_plot.set_xlim(0, HISTORY_WINDOW)
+        self.fig.canvas.draw_idle()
+
+    # ----------------------- ANIMATION DRIVER --------------------
+    def _update_frame(self, frame):
+        self.step()                                       # physics
+        self.grid_img.set_data(np.argmax(self.state, -1)) # lattice colours
+
+        # record new mean proportions
+        means = self.state.mean(axis=(0, 1))
+        for idx, k in enumerate(['S', 'I', 'R']):
+            self.history[k].append(means[idx])
+            if len(self.history[k]) > HISTORY_WINDOW:
+                self.history[k] = self.history[k][-HISTORY_WINDOW:]
+            self.lines[k].set_data(np.arange(len(self.history[k])),
+                                   self.history[k])
+
+        # keep x-axis scrolling
+        n = len(self.history['S'])
+        self.ax_plot.set_xlim(max(0, n - HISTORY_WINDOW), max(HISTORY_WINDOW, n))
+
+        return (self.grid_img, *self.lines.values())
+
+    def run(self):
+        self.ani = FuncAnimation(self.fig,
+                                 self._update_frame,
+                                 interval=50,
+                                 blit=True,
+                                 cache_frame_data=False,
+                                 save_count=MAX_FRAMES)
+        plt.show()
+
+
+# ------------------------------- MAIN -----------------------------
+if __name__ == "__main__":
+    sim = SIRSimulation()
+    sim.run()
